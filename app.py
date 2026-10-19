@@ -1,6 +1,8 @@
 import io
 import json
 import math
+import time
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -13,27 +15,26 @@ st.set_page_config(page_title="Baumgartner Real Estate Intelligence", page_icon=
 # -----------------------------
 # Configuration
 # -----------------------------
-FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+NYFED_EFFR = "https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json"
+TREASURY_XML = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml"
 ECB_API = "https://data-api.ecb.europa.eu/service/data/{flow}/{key}"
 BBK_API = "https://api.statistiken.bundesbank.de/rest/data/{flow}/{key}"
 EUROSTAT_API = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/{dataset}"
 
 SERIES = {
     "Fed Funds": {
-        "kind": "fred",
-        "id": "EFFR",
+        "kind": "nyfed_effr",
         "unit": "%",
-        "source": "Federal Reserve / FRED",
-        "url": "https://fred.stlouisfed.org/series/EFFR",
+        "source": "Federal Reserve Bank of New York",
+        "url": "https://www.newyorkfed.org/markets/reference-rates/effr",
         "frequency": "täglich",
         "history_years": 10,
     },
     "US 10Y": {
-        "kind": "fred",
-        "id": "DGS10",
+        "kind": "treasury_10y",
         "unit": "%",
-        "source": "U.S. Treasury / FRED",
-        "url": "https://fred.stlouisfed.org/series/DGS10",
+        "source": "U.S. Department of the Treasury",
+        "url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/TextView?type=daily_treasury_yield_curve",
         "frequency": "täglich",
         "history_years": 10,
     },
@@ -85,21 +86,73 @@ HEADERS = {"User-Agent": "Baumgartner-Real-Estate-Intelligence/0.1"}
 
 
 def _get(url, **kwargs):
-    r = requests.get(url, timeout=25, headers=HEADERS, **kwargs)
-    r.raise_for_status()
-    return r
+    # Official statistics endpoints can occasionally be slow on Streamlit Cloud.
+    # Retry transient failures instead of immediately blanking the dashboard.
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=45, headers=HEADERS, **kwargs)
+            r.raise_for_status()
+            return r
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_exc
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fred(series_id: str) -> pd.DataFrame:
-    r = _get(FRED_CSV.format(series_id=series_id))
-    df = pd.read_csv(io.StringIO(r.text))
-    date_col = df.columns[0]
-    value_col = df.columns[1]
-    df = df.rename(columns={date_col: "date", value_col: "value"})
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    return df.dropna().sort_values("date")
+def fetch_nyfed_effr(history_years: int = 10) -> pd.DataFrame:
+    end = date.today()
+    start = end - timedelta(days=366 * history_years)
+    params = {
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "type": "rate",
+    }
+    payload = _get(NYFED_EFFR, params=params).json()
+    rows = payload.get("refRates", [])
+    if not rows:
+        raise ValueError("NY Fed lieferte keine EFFR-Beobachtungen.")
+    out = pd.DataFrame(rows)
+    if "effectiveDate" not in out.columns or "percentRate" not in out.columns:
+        raise ValueError(f"NY-Fed-Format unerwartet: {list(out.columns)[:12]}")
+    out = out[["effectiveDate", "percentRate"]].rename(
+        columns={"effectiveDate": "date", "percentRate": "value"}
+    )
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    return out.dropna().drop_duplicates("date").sort_values("date")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_treasury_10y(history_years: int = 10) -> pd.DataFrame:
+    # Treasury's official XML feed is keyless and considerably more reliable
+    # from Streamlit Cloud than FRED's graph-download endpoint.
+    current_year = date.today().year
+    first_year = current_year - history_years
+    rows = []
+    for year in range(first_year, current_year + 1):
+        params = {
+            "data": "daily_treasury_yield_curve",
+            "field_tdr_date_value": str(year),
+        }
+        r = _get(TREASURY_XML, params=params)
+        root = ET.fromstring(r.content)
+        for entry in root.iter():
+            if entry.tag.rsplit("}", 1)[-1] != "entry":
+                continue
+            fields = {node.tag.rsplit("}", 1)[-1]: node.text for node in entry.iter()}
+            dt = fields.get("NEW_DATE")
+            val = fields.get("BC_10YEAR")
+            if dt and val not in (None, ""):
+                rows.append((dt[:10], val))
+    if not rows:
+        raise ValueError("U.S. Treasury lieferte keine 10Y-Beobachtungen.")
+    out = pd.DataFrame(rows, columns=["date", "value"])
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    return out.dropna().drop_duplicates("date").sort_values("date")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -130,7 +183,9 @@ def fetch_bbk(flow: str, key: str) -> pd.DataFrame:
         "startPeriod": "2000-01-01" if key.startswith("D.") else "2000-01",
     }
     r = _get(BBK_API.format(flow=flow, key=key), params=params)
-    df = pd.read_csv(io.StringIO(r.text))
+    # Bundesbank currently returns SDMX-CSV with semicolon delimiters.
+    # sep=None auto-detects this and remains robust if the service changes back to commas.
+    df = pd.read_csv(io.StringIO(r.text), sep=None, engine="python")
     # Bundesbank SDMX-CSV uses TIME_PERIOD and OBS_VALUE.
     date_col = next((c for c in df.columns if c.upper() == "TIME_PERIOD"), None)
     value_col = next((c for c in df.columns if c.upper() == "OBS_VALUE"), None)
@@ -177,8 +232,10 @@ def fetch_eurostat_hpi(dataset: str) -> pd.DataFrame:
 
 
 def load_series(cfg: dict) -> pd.DataFrame:
-    if cfg["kind"] == "fred":
-        return fetch_fred(cfg["id"])
+    if cfg["kind"] == "nyfed_effr":
+        return fetch_nyfed_effr(cfg.get("history_years", 10))
+    if cfg["kind"] == "treasury_10y":
+        return fetch_treasury_10y(cfg.get("history_years", 10))
     if cfg["kind"] == "ecb":
         return fetch_ecb(cfg["flow"], cfg["key"])
     if cfg["kind"] == "bbk":
